@@ -104,4 +104,5 @@ class VisionGuard:
 # Programın başlangıç noktası
 if __name__ == "__main__":
     tracker = VisionGuard(camera_id=0)
+
     tracker.start()
