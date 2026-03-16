@@ -180,7 +180,7 @@ visionguard-ai/
 
 <div align="center">
 
-**Özgür Ulusoy** · Software Engineering Student 🇹🇷
+**Özgür Ulusoy** · Software Engineering Student 
 
 [![GitHub](https://img.shields.io/badge/GitHub-ulusoyozgur-181717?style=for-the-badge&logo=github&logoColor=white)](https://github.com/ulusoyozgur)
 [![Website](https://img.shields.io/badge/Website-ulusoyozgur.vercel.app-000000?style=for-the-badge&logo=vercel&logoColor=white)](https://ulusoyozgur.vercel.app)
