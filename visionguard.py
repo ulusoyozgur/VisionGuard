@@ -12,6 +12,13 @@ from pathlib import Path
 # DeepFace — duygu, yaş, cinsiyet, kişi tanıma
 try:
     from deepface import DeepFace
+    # Model warm-up: ilk analizin yavaş olmaması için
+    _warmup_img = np.zeros((64, 64, 3), dtype=np.uint8)
+    try:
+        DeepFace.analyze(_warmup_img, actions=["emotion"],
+                         enforce_detection=False, silent=True)
+    except Exception:
+        pass
     DEEPFACE_OK = True
 except ImportError:
     DEEPFACE_OK = False
@@ -26,7 +33,7 @@ CONFIG_FILE = "visionguard_config.json"
 
 DEFAULT_CONFIG = {
     "camera_id": 0,
-    "window_title": "VisionGuard AI v3.0",
+    "window_title": "VisionGuard AI v3.1",
     "detection": {
         "scaleFactor": 1.1,
         "minNeighbors": 5,
@@ -48,7 +55,8 @@ DEFAULT_CONFIG = {
         "recognition": True,
         "recognition_db": "known_faces",
         "recognition_model": "VGG-Face",
-        "recognition_threshold": 0.6
+        # DÜZELTME #5: VGG-Face cosine için güvenli threshold 0.40
+        "recognition_threshold": 0.40
     },
     "tracking": {
         "enabled": True,
@@ -103,23 +111,26 @@ def setup_logging() -> None:
 @dataclass
 class PerformanceMonitor:
     fps: float = 0.0
-    frame_count: int = 0
+    # DÜZELTME #4: frame_count ve total birbirinden ayrıldı
+    _window_frames: int = field(default=0, repr=False)
+    total_frames: int = 0
     total_faces_detected: int = 0
     _prev_time: float = field(default_factory=time.time, repr=False)
 
     def update(self, face_count: int) -> None:
-        self.frame_count += 1
+        self._window_frames += 1
+        self.total_frames += 1
         self.total_faces_detected += face_count
         now = time.time()
         elapsed = now - self._prev_time
         if elapsed >= 0.5:
-            self.fps = self.frame_count / elapsed
-            self.frame_count = 0
+            self.fps = self._window_frames / elapsed
+            self._window_frames = 0      # sadece pencere sıfırlanır
             self._prev_time = now
 
     def summary(self) -> str:
         return (
-            f"Toplam Frame: {self.frame_count} | "
+            f"Toplam Frame: {self.total_frames} | "
             f"Toplam Yüz Tespiti: {self.total_faces_detected}"
         )
 
@@ -129,10 +140,7 @@ class PerformanceMonitor:
 # ─────────────────────────────────────────────
 
 class CentroidTracker:
-    """
-    Her yüze benzersiz bir ID atar ve yüz kaybolunca
-    max_disappeared kadar hafızada tutar.
-    """
+    """Her yüze benzersiz ID atar, kaybolunca max_disappeared kadar hafızada tutar."""
 
     def __init__(self, max_disappeared: int = 30):
         self.next_id = 0
@@ -248,9 +256,16 @@ class VisionGuard:
         ) if config["tracking"]["enabled"] else None
 
         self.face_infos: dict[int, FaceInfo] = {}
+
+        # DÜZELTME #1: Hem flag hem veri için aynı lock kullanılıyor
         self._analysis_lock = threading.Lock()
-        self._analysis_running = False
+        self._analysis_running = False  # sadece lock altında okunup yazılacak
+
         self._frame_counter = 0
+
+        # DÜZELTME #2: Yüz kayıt isteği ana döngüyü bloklamıyor
+        self._register_requested = False
+        self._register_lock = threading.Lock()
 
     # ── Yardımcı ──────────────────────────────
 
@@ -279,7 +294,10 @@ class VisionGuard:
         if not self.cap.isOpened():
             logging.error(f"Kamera açılamadı (ID: {self.camera_id})")
             return
-        logging.info("VisionGuard v3.0 başlatıldı. [q] çıkış | [s] ekran görüntüsü | [r] kişi kaydet")
+        logging.info(
+            "VisionGuard v3.1 başlatıldı. "
+            "[q] çıkış | [s] ekran görüntüsü | [r] kişi kaydet"
+        )
         try:
             self._run_loop()
         except Exception as e:
@@ -288,8 +306,8 @@ class VisionGuard:
             self._cleanup()
 
     def _run_loop(self) -> None:
-        rec_enabled = self.cfg["recording"]["enabled"]
-        ai_cfg = self.cfg["ai"]
+        rec_enabled   = self.cfg["recording"]["enabled"]
+        ai_cfg        = self.cfg["ai"]
         analyze_every = ai_cfg["analyze_every_n_frames"]
 
         while True:
@@ -313,9 +331,25 @@ class VisionGuard:
                 )
 
             self._frame_counter += 1
-            if (DEEPFACE_OK and self._frame_counter % analyze_every == 0
-                    and not self._analysis_running and len(faces) > 0):
-                self._schedule_analysis(frame.copy(), list(faces), objects)
+
+            # DÜZELTME #1: _analysis_running flag lock altında okunuyor
+            with self._analysis_lock:
+                already_running = self._analysis_running
+
+            if (DEEPFACE_OK
+                    and self._frame_counter % analyze_every == 0
+                    and not already_running
+                    and len(faces) > 0):
+                self._schedule_analysis(frame.copy(), list(faces), dict(objects))
+
+            # DÜZELTME #2: Kayıt isteği varsa thread'de işle
+            with self._register_lock:
+                reg_req = self._register_requested
+                if reg_req:
+                    self._register_requested = False
+
+            if reg_req:
+                self._register_face_threaded(frame.copy(), list(faces))
 
             self._draw_detections(frame, gray, faces, objects)
             self._draw_overlay(frame, len(faces))
@@ -332,7 +366,9 @@ class VisionGuard:
             elif key == ord("s"):
                 self._take_screenshot(frame)
             elif key == ord("r"):
-                self._register_face(frame, faces)
+                # DÜZELTME #2: Sadece flag set ediliyor, input() burada çağrılmıyor
+                with self._register_lock:
+                    self._register_requested = True
 
             self.perf.update(len(faces))
 
@@ -356,31 +392,42 @@ class VisionGuard:
 
     def _schedule_analysis(self, frame, faces, objects) -> None:
         """DeepFace analizini ayrı thread'de çalıştır — ana döngüyü bloklamaz."""
-        self._analysis_running = True
+
+        # DÜZELTME #1: Flag lock altında set ediliyor
+        with self._analysis_lock:
+            self._analysis_running = True
 
         def _analyze():
-            ai = self.cfg["ai"]
+            ai      = self.cfg["ai"]
             actions = []
             if ai["emotion"]:
                 actions.append("emotion")
             if ai["age_gender"]:
                 actions.extend(["age", "gender"])
 
+            updated_infos: dict[int, FaceInfo] = {}
+
             for i, (x, y, w, h) in enumerate(faces):
                 face_img = frame[y:y+h, x:x+w]
                 if face_img.size == 0:
                     continue
 
+                # En yakın centroid'e göre obj_id bul
                 obj_id = i
                 if objects:
                     cx, cy = x + w // 2, y + h // 2
                     obj_id = min(
                         objects,
-                        key=lambda oid: np.linalg.norm(objects[oid] - [cx, cy])
+                        key=lambda oid: np.linalg.norm(
+                            np.array(objects[oid]) - [cx, cy]
+                        )
                     )
 
-                info = self.face_infos.get(obj_id, FaceInfo(obj_id=obj_id))
+                # Mevcut bilgiyi al (lock altında kopyala)
+                with self._analysis_lock:
+                    info = self.face_infos.get(obj_id, FaceInfo(obj_id=obj_id))
 
+                # Duygu / yaş / cinsiyet
                 if actions:
                     try:
                         result = DeepFace.analyze(
@@ -393,14 +440,16 @@ class VisionGuard:
                             scores = r.get("emotion", {})
                             info.emotion_score = scores.get(info.emotion, 0.0)
                         if ai["age_gender"]:
-                            info.age = int(r.get("age", 0))
+                            info.age    = int(r.get("age", 0))
                             info.gender = r.get("dominant_gender", "?")
                     except Exception as e:
                         logging.debug(f"DeepFace analiz hatası: {e}")
 
+                # Kişi tanıma
                 if ai["recognition"]:
                     db = ai["recognition_db"]
-                    if Path(db).exists() and any(Path(db).iterdir()):
+                    db_path = Path(db)
+                    if db_path.exists() and any(db_path.iterdir()):
                         try:
                             matches = DeepFace.find(
                                 face_img, db_path=db,
@@ -409,22 +458,24 @@ class VisionGuard:
                             )
                             if matches and len(matches[0]) > 0:
                                 best = matches[0].iloc[0]
-                                dist = best.get(
-                                    f"{ai['recognition_model']}_cosine", 1.0
-                                )
+                                # DÜZELTME #5: threshold düşürüldü (0.40)
+                                dist_key = f"{ai['recognition_model']}_cosine"
+                                dist = best.get(dist_key, 1.0)
                                 if dist < ai["recognition_threshold"]:
-                                    identity = Path(best["identity"]).stem
-                                    info.name = identity.replace("_", " ").title()
+                                    identity   = Path(best["identity"]).stem
+                                    info.name  = identity.replace("_", " ").title()
                                 else:
                                     info.name = "Bilinmiyor"
                         except Exception as e:
                             logging.debug(f"Kişi tanıma hatası: {e}")
 
                 info.last_updated = time.time()
-                with self._analysis_lock:
-                    self.face_infos[obj_id] = info
+                updated_infos[obj_id] = info
 
-            self._analysis_running = False
+            # DÜZELTME #1: Tüm güncellemeler tek seferde lock altında yazılıyor
+            with self._analysis_lock:
+                self.face_infos.update(updated_infos)
+                self._analysis_running = False
 
         t = threading.Thread(target=_analyze, daemon=True)
         t.start()
@@ -442,10 +493,14 @@ class VisionGuard:
     }
 
     def _draw_detections(self, frame, gray, faces, objects) -> None:
-        disp = self.cfg["display"]
+        disp    = self.cfg["display"]
         f_color = tuple(disp["box_color"])
         e_color = tuple(disp["eye_box_color"])
         k_color = tuple(disp["known_color"])
+
+        # DÜZELTME #1: face_infos'u lock altında snapshot al
+        with self._analysis_lock:
+            face_infos_snapshot = dict(self.face_infos)
 
         for i, (x, y, w, h) in enumerate(faces):
             obj_id = i
@@ -453,11 +508,13 @@ class VisionGuard:
                 cx, cy = x + w // 2, y + h // 2
                 obj_id = min(
                     objects,
-                    key=lambda oid: np.linalg.norm(objects[oid] - [cx, cy])
+                    key=lambda oid: np.linalg.norm(
+                        np.array(objects[oid]) - [cx, cy]
+                    )
                 )
 
-            info: FaceInfo | None = self.face_infos.get(obj_id)
-            is_known = info and info.name != "Bilinmiyor"
+            info: FaceInfo | None = face_infos_snapshot.get(obj_id)
+            is_known  = info and info.name != "Bilinmiyor"
             box_color = k_color if is_known else f_color
 
             cv2.rectangle(frame, (x, y), (x + w, y + h), box_color, 2)
@@ -493,9 +550,9 @@ class VisionGuard:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
 
     def _draw_overlay(self, frame, face_count: int) -> None:
-        disp = self.cfg["display"]
-        h, w = frame.shape[:2]
-        lines = []
+        disp    = self.cfg["display"]
+        h, w    = frame.shape[:2]
+        lines   = []
 
         if disp["show_fps"]:
             lines.append(f"FPS: {self.perf.fps:.1f}")
@@ -509,7 +566,11 @@ class VisionGuard:
             cv2.putText(frame, text, (10, 22 + i * 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
 
-        if self._analysis_running:
+        # DÜZELTME #1: Flag lock altında okunuyor
+        with self._analysis_lock:
+            running = self._analysis_running
+
+        if running:
             cv2.putText(frame, "AI analiz ediyor...", (10, h - 12),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 200, 255), 1)
 
@@ -518,23 +579,37 @@ class VisionGuard:
             cv2.putText(frame, "REC", (w - 55, 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
 
-    # ── Kişi Kaydetme ─────────────────────────
+    # ── Kişi Kaydetme (thread-safe, non-blocking) ──
 
-    def _register_face(self, frame, faces) -> None:
+    def _register_face_threaded(self, frame, faces) -> None:
+        """
+        DÜZELTME #2: input() ayrı thread'de çalışır,
+        ana döngü (kamera) bloklanmaz.
+        """
         if len(faces) == 0:
             logging.warning("Kayıt için kameraya bakın.")
             return
-        x, y, w, h = faces[0]
-        face_img = frame[y:y+h, x:x+w]
-        name = input("Kişi adı girin (boşluk yerine _ kullanın): ").strip()
-        if not name:
-            return
-        person_dir = Path(self.cfg["ai"]["recognition_db"]) / name
-        person_dir.mkdir(exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = person_dir / f"{name}_{ts}.jpg"
-        cv2.imwrite(str(path), face_img)
-        logging.info(f"Yüz kaydedildi: {path}")
+
+        def _do_register():
+            x, y, w, h = faces[0]
+            face_img = frame[y:y+h, x:x+w]
+            try:
+                name = input(
+                    "\nKişi adı girin (boşluk yerine _ kullanın): "
+                ).strip()
+            except EOFError:
+                return
+            if not name:
+                return
+            person_dir = Path(self.cfg["ai"]["recognition_db"]) / name
+            person_dir.mkdir(exist_ok=True)
+            ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = person_dir / f"{name}_{ts}.jpg"
+            cv2.imwrite(str(path), face_img)
+            logging.info(f"Yüz kaydedildi: {path}")
+
+        t = threading.Thread(target=_do_register, daemon=True)
+        t.start()
 
     # ── Ekran Görüntüsü ───────────────────────
 
